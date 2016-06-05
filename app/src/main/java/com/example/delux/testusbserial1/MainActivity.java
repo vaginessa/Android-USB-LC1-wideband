@@ -1,13 +1,20 @@
 package com.example.delux.testusbserial1;
 
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbManager;
+import android.hardware.usb.UsbRequest;
 import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.TextView;
 
 import com.hoho.android.usbserial.driver.*;
@@ -18,7 +25,7 @@ import java.util.Timer;
 import java.util.TimerTask;
 
 interface StatusChangeListener {
-    public void onStatusChange(Object o, String status);
+    public void onStatusChange(Object o, String status, double afr);
 }
 
 class LC1Parser {
@@ -26,6 +33,11 @@ class LC1Parser {
     int cnt = 0;
     byte[] pkt = new byte[4];
     StatusChangeListener listener;
+    boolean afOverride;
+
+    public LC1Parser(StatusChangeListener lis) {
+        listener = lis;
+    }
 
     public boolean feedData(byte b) {
         cnt++;
@@ -54,11 +66,18 @@ class LC1Parser {
             int func = (pkt[0] >> 2) & 7;
             int af = pkt[1] | ((pkt[0] & 0x01) << 7);
             int l = pkt[3] | (pkt[2] << 7);
+            double afr = -1;
             switch(func) {
-                case 1: status = String.format("AFR=%.1f",l/10.0); break;
-                default: status = String.format("FUNC=%d",func);
+                case 0: if(afOverride) af = 147; afr = (l+500)*af/10000.0; status = String.format("AFR=%.1f (af=%d l=%d)",afr,af,l); break;
+                case 1: afr = l/10.0; status = String.format("AFR=%.1f",afr); break;
+                case 2: status = "Calibration in progress"; break;
+                case 3: status = "Calibration needed"; break;
+                case 4: status = String.format("Warmup %d",l); break;
+                case 5: status = String.format("Heater calibration %d",l); break;
+                case 6: status = String.format("ERROR %d",l); break;
+                default: status = String.format("FUNC=%d",func); break;
             }
-            if(listener != null) listener.onStatusChange(this,String.format("Rcv %6d %s", cnt, status));
+            if(listener != null) listener.onStatusChange(this,String.format("Rcv %8d (F%d) %s", cnt, func, status),afr);
             pos = 0;
         }
         return true;
@@ -66,6 +85,9 @@ class LC1Parser {
 }
 
 public class MainActivity extends AppCompatActivity implements StatusChangeListener {
+
+    UsbManager usbManager;
+    PendingIntent mPermissionIntent;
 
     boolean isOpen = false;
     boolean canOpen = false;
@@ -77,6 +99,14 @@ public class MainActivity extends AppCompatActivity implements StatusChangeListe
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        Thread.setDefaultUncaughtExceptionHandler(new TopExceptionHandler(this));
+        usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
+
+        mPermissionIntent = PendingIntent.getBroadcast(this, 0, new Intent(
+                ACTION_USB_PERMISSION), 0);
+        IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
+        registerReceiver(mUsbReceiver, filter);
+
         setContentView(R.layout.activity_main);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         Timer t = new Timer();
@@ -94,7 +124,7 @@ public class MainActivity extends AppCompatActivity implements StatusChangeListe
     }
 
     @Override
-    public void onStatusChange(Object o, final String status) {
+    public void onStatusChange(Object o, final String status, final double afr) {
         final String sts = status;
         runOnUiThread(new Runnable() {
             @Override
@@ -103,6 +133,7 @@ public class MainActivity extends AppCompatActivity implements StatusChangeListe
                 if (tv != null) {
                     tv.setText(status);
                 }
+                ((TextView)findViewById(R.id.tvAFR)).setText(String.format("AFR %.1f",afr));
             }
         });
     }
@@ -129,6 +160,7 @@ public class MainActivity extends AppCompatActivity implements StatusChangeListe
 
     class SerialReceiver extends TimerTask {
         public void run() {
+            lc1parser.afOverride = ((CheckBox)findViewById(R.id.cbAFOverride)).isChecked();
             try {
                 byte[] rd = new byte[256];
                 int cnt = port.read(rd, 10);
@@ -169,6 +201,30 @@ public class MainActivity extends AppCompatActivity implements StatusChangeListe
         }
     }
 
+    String ACTION_USB_PERMISSION = "com.android.example.USB_PERMISSION";
+
+    class UsbReceiver extends BroadcastReceiver {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if(intent.getAction().equals(ACTION_USB_PERMISSION)) {
+                final UsbDevice device = (UsbDevice)intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
+                    if(device != null){
+                        //call method to set up device communication
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                SetupComm(device);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    UsbReceiver mUsbReceiver = new UsbReceiver();
+
     protected void onBtnClicked(View v) {
         TextView tv = (TextView) findViewById(R.id.textView);
         Button btOpen = (Button) findViewById(R.id.btOpenClose);
@@ -180,6 +236,7 @@ public class MainActivity extends AppCompatActivity implements StatusChangeListe
                     Thread.sleep(50);
                     port.close();
                     tv.setText("Closed. Easy :)");
+                    ((Button)findViewById(R.id.btEnum)).setEnabled(true);
                 } catch (Exception e) {
                     e.printStackTrace();
                     tv.setText("Error closing.");
@@ -188,27 +245,51 @@ public class MainActivity extends AppCompatActivity implements StatusChangeListe
                 isOpen = false;
             } else {
                 //open
-                UsbManager um = (UsbManager) getSystemService(Context.USB_SERVICE);
-                UsbDeviceConnection udc = um.openDevice(port.getDriver().getDevice());
                 try {
-                    port.open(udc);
-                    // innovate LC-1 runs at 19200 8n1
-                    port.setParameters(19200, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE);
-                    tmr = new Timer();
-                    ttask = new SerialReceiver();
-                    lc1parser.listener = this;
-                    tmr.schedule(ttask, 100, 500);
-                    btOpen.setText("Close");
-                    tv.setText("Port open. Easy :)");
-                    isOpen = true;
-                } catch (IOException e) {
-                    tv.setText("Error opening.");
+                    UsbDevice dev = port.getDriver().getDevice();
+                    usbManager.requestPermission(dev,mPermissionIntent);
+                } catch (Exception e) {
+                    StackTraceElement[] se = e.getStackTrace();
+                    StringBuilder sb = new StringBuilder();
+                    for(StackTraceElement ee: se) {
+                        sb.append(ee.toString()+"\n");
+                    }
+                    tv.setText("Error opening.\n"+e.getMessage()+"\n"+sb.toString());
                     e.printStackTrace();
                 }
             }
         }
         if (v.getId() == R.id.btEnum) {
             EnumerateSerialPorts();
+        }
+    }
+
+    private void SetupComm(UsbDevice dev) {
+        TextView tv = (TextView) findViewById(R.id.textView);
+        Button btOpen = (Button) findViewById(R.id.btOpenClose);
+        try {
+            UsbDeviceConnection udc = usbManager.openDevice(dev);
+            if (udc == null) {
+                throw new Exception("openDevice(" + dev.getDeviceName() + ") FAILED.");
+            }
+            port.open(udc);
+            // innovate LC-1 runs at 19200 8n1
+            port.setParameters(19200, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE);
+            tmr = new Timer();
+            ttask = new SerialReceiver();
+            lc1parser = new LC1Parser(this);
+            tmr.schedule(ttask, 100, 500);
+            btOpen.setText("Close");
+            tv.setText("Port open. Easy :)");
+            ((Button)findViewById(R.id.btEnum)).setEnabled(false);
+            isOpen = true;
+        } catch (Exception e) {
+            StackTraceElement[] se = e.getStackTrace();
+            StringBuilder sb = new StringBuilder();
+            for(StackTraceElement ee: se) {
+                sb.append(ee.toString()+"\n");
+            }
+            tv.setText("Error opening.\n"+e.getMessage()+"\n"+sb.toString());
         }
     }
 
